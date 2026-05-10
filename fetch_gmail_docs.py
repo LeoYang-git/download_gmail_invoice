@@ -1,76 +1,78 @@
 #!/usr/bin/env python3
 """
-Gmail Invoice Downloader
-========================
-Downloads invoice and receipt attachments from Gmail, saving them to a local folder.
-Park'nPay and Too Good To Go emails are excluded.
+Gmail Financial Document Fetcher
+==================================
+Downloads financial document attachments from Gmail into OneDrive Inbox.
 
-── Setup (one-time) ──────────────────────────────────────────────────────────
+Rules-based: each biller has its own Gmail query. By default downloads
+the previous calendar month. Use --since for a bulk backfill.
 
-1. Enable the Gmail API & create credentials:
-   a. Go to https://console.cloud.google.com/
-   b. Create a new project (e.g. "Invoice Downloader")
-   c. Go to "APIs & Services" → "Enable APIs & Services"
-      Search for "Gmail API" and click Enable
-   d. Go to "APIs & Services" → "Credentials" → "Create Credentials" → "OAuth client ID"
-      - Application type: Desktop app
-      - Name: anything you like
-   e. Click "Download JSON", rename the file to  credentials.json
-      and put it in the SAME folder as this script
-
-2. Install Python dependencies (run once in Terminal):
-   pip3 install google-api-python-client google-auth-httplib2 google-auth-oauthlib
-
-3. Run this script:
-   python3 download_invoices.py
-
-   On first run a browser window will open asking you to sign in to Google
-   and grant read-only Gmail access. After that a token.json file is saved
-   so you won't need to sign in again.
-
-── Output ────────────────────────────────────────────────────────────────────
-
-Files are saved to the OUTPUT_DIR folder defined below, named:
-  YYYY-MM-DD_Sender_Subject.pdf  (etc.)
-
-Duplicate filenames get a numeric suffix (_2, _3 …).
+Usage:
+  python3 fetch_gmail_docs.py                        # previous month
+  python3 fetch_gmail_docs.py --since 2024/01/01     # backfill from date
+  python3 fetch_gmail_docs.py --rule "Rental"        # one rule only (case-insensitive)
 """
 
+import argparse
 import base64
-import os
 import re
 import sys
+from datetime import date
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Output ────────────────────────────────────────────────────────────────────
 
-# Where to save downloaded invoices
-OUTPUT_DIR = Path.home() / "Library" / "CloudStorage" / "OneDrive-Personal" / "Inbox" / "Invoices"
+INBOX_DIR = Path.home() / "Library" / "CloudStorage" / "OneDrive-Personal" / "Inbox"
 
-# Gmail search queries  (senders to skip are baked in)
+# ── Rules ─────────────────────────────────────────────────────────────────────
+# Each rule downloads to its own Inbox subfolder. inbox_dir is the subfolder
+# name; the classifier uses it to determine category and destination without
+# needing to re-classify well-known sources.
+
+RULES = [
+    {
+        "name": "Rental Statement",
+        "query": "from:@resbymirvac.com has:attachment",
+        "inbox_dir": "Rental Statement",  # → Properties/Waterloo
+    },
+    {
+        "name": "Council Payment",
+        "query": "from:kuringgai@pml.com.au has:attachment",
+        "inbox_dir": "Council Payment",   # → Properties/Lindfield
+    },
+    {
+        "name": "Electricity Bill",
+        "query": "from:noreply@amber.com.au has:attachment",
+        "inbox_dir": "Electricity Bill",  # → Properties/Lindfield
+    },
+    {
+        "name": "More Telecom",
+        "query": "from:@moretelecom.com.au has:attachment",
+        "inbox_dir": "More Telecom",      # → Spending/Software
+    },
+    {
+        "name": "Generic Invoices & Receipts",
+        "query": (
+            "(subject:invoice OR subject:receipt OR subject:\"tax invoice\""
+            " OR subject:bill OR subject:statement) has:attachment"
+            " -from:@resbymirvac.com"
+            " -from:kuringgai@pml.com.au"
+            " -from:noreply@amber.com.au"
+            " -from:@moretelecom.com.au"
+        ),
+        "inbox_dir": "Generic",           # → full classification
+    },
+]
+
+# Senders to skip even if matched by a query
 EXCLUDE_SENDERS = [
     "no-reply@parknpay.nsw.gov.au",
     "no-reply@toogoodtogo.com",
 ]
 
-SEARCH_QUERIES = [
-    (
-        "subject:invoice after:2023/07/01 has:attachment"
-        " -from:no-reply@parknpay.nsw.gov.au"
-        " -from:no-reply@toogoodtogo.com"
-    ),
-    (
-        "(subject:receipt OR subject:\"tax invoice\") after:2023/07/01 has:attachment"
-        " -from:no-reply@parknpay.nsw.gov.au"
-        " -from:no-reply@toogoodtogo.com"
-    ),
-]
+ALLOWED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".docx", ".doc"}
 
-# Only download files with these extensions (empty list = download everything)
-ALLOWED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".docx", ".doc", ".png", ".jpg", ".jpeg"}
-
-# Gmail API scope — read-only is enough
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 # ── Dependency check ──────────────────────────────────────────────────────────
@@ -83,15 +85,13 @@ try:
 except ImportError:
     print(
         "\n[ERROR] Missing dependencies.\n"
-        "Run this in Terminal and then try again:\n\n"
-        "  pip3 install google-api-python-client google-auth-httplib2 google-auth-oauthlib\n"
+        "Run: pip3 install google-api-python-client google-auth-httplib2 google-auth-oauthlib\n"
     )
     sys.exit(1)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def sanitise(text: str, max_len: int = 60) -> str:
-    """Make text safe to use as part of a filename."""
     text = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:max_len].strip(" ._")
@@ -105,17 +105,12 @@ def parse_date(raw: str) -> str:
 
 
 def get_service():
-    """Authenticate with Gmail and return a service object."""
     creds = None
     token_path = Path(__file__).parent / "token.json"
     creds_path = Path(__file__).parent / "credentials.json"
 
     if not creds_path.exists():
-        print(
-            "\n[ERROR] credentials.json not found.\n"
-            f"Expected location: {creds_path}\n"
-            "Follow the Setup steps in the header of this script.\n"
-        )
+        print(f"\n[ERROR] credentials.json not found at {creds_path}\n")
         sys.exit(1)
 
     if token_path.exists():
@@ -133,7 +128,6 @@ def get_service():
 
 
 def iter_all_threads(service, query: str):
-    """Yield every thread matching a Gmail search query, handling pagination."""
     page_token = None
     while True:
         params = {"userId": "me", "q": query, "maxResults": 500}
@@ -148,7 +142,6 @@ def iter_all_threads(service, query: str):
 
 
 def all_parts(payload: dict):
-    """Recursively yield every part of a MIME message payload."""
     if "parts" in payload:
         for part in payload["parts"]:
             yield from all_parts(part)
@@ -157,7 +150,6 @@ def all_parts(payload: dict):
 
 
 def unique_path(directory: Path, stem: str, suffix: str) -> Path:
-    """Return a Path that doesn't already exist, appending _2, _3 … if needed."""
     candidate = directory / f"{stem}{suffix}"
     counter = 2
     while candidate.exists():
@@ -167,7 +159,6 @@ def unique_path(directory: Path, stem: str, suffix: str) -> Path:
 
 
 def download_attachments(service, message: dict, output_dir: Path) -> int:
-    """Download all allowed attachments from one Gmail message. Returns file count."""
     msg_id = message["id"]
     headers = {
         h["name"]: h["value"]
@@ -175,10 +166,6 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
     }
 
     date_str = parse_date(headers.get("Date", ""))
-    raw_from  = headers.get("From", "unknown")
-    # Extract just the sender name or domain for the filename
-    sender_name = re.sub(r"<.*?>", "", raw_from).strip() or raw_from.split("@")[-1].split(">")[0]
-    sender = sanitise(sender_name, 30) or "unknown"
     subject = sanitise(headers.get("Subject", "no-subject"), 60)
 
     saved = 0
@@ -195,7 +182,6 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
         attachment_id = body.get("attachmentId")
         data = body.get("data")
 
-        # Fetch attachment data if not already inline
         if attachment_id:
             att = (
                 service.users()
@@ -210,7 +196,7 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
             continue
 
         file_bytes = base64.urlsafe_b64decode(data)
-        stem = f"{date_str}_{sender}_{subject}"
+        stem = f"{subject}_{date_str}"
         out_path = unique_path(output_dir, stem, suffix)
         out_path.write_bytes(file_bytes)
         print(f"    ✓  {out_path.name}")
@@ -219,56 +205,95 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
     return saved
 
 
+def previous_month_start() -> str:
+    today = date.today()
+    if today.month == 1:
+        return date(today.year - 1, 12, 1).strftime("%Y/%m/%d")
+    return date(today.year, today.month - 1, 1).strftime("%Y/%m/%d")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"\nInvoice downloader starting …")
-    print(f"Output folder: {OUTPUT_DIR}\n")
+    parser = argparse.ArgumentParser(description="Download financial document attachments from Gmail.")
+    parser.add_argument(
+        "--since",
+        metavar="YYYY/MM/DD",
+        default=None,
+        help="Download emails since this date (default: 1st of previous month)",
+    )
+    parser.add_argument(
+        "--rule",
+        metavar="NAME",
+        default=None,
+        help="Run only the rule whose name contains this string (case-insensitive)",
+    )
+    args = parser.parse_args()
+
+    since = args.since or previous_month_start()
+    date_filter = f"after:{since}"
+
+    active_rules = RULES
+    if args.rule:
+        active_rules = [r for r in RULES if args.rule.lower() in r["name"].lower()]
+        if not active_rules:
+            names = ", ".join(f'"{r["name"]}"' for r in RULES)
+            print(f'[ERROR] No rule matching "{args.rule}". Available: {names}')
+            sys.exit(1)
+
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"\nDownloader starting …")
+    print(f"Date filter : {date_filter}")
+    print(f"Inbox       : {INBOX_DIR}")
+    print(f"Rules       : {', '.join(r['name'] for r in active_rules)}\n")
 
     service = get_service()
     seen_thread_ids: set = set()
     total_threads = 0
     total_files = 0
 
-    for query in SEARCH_QUERIES:
-        print(f"Searching Gmail: {query[:90]} …")
-        thread_count = 0
+    for rule in active_rules:
+        query = f"{rule['query']} {date_filter}"
+        print(f"── {rule['name']} ──────────────────────────────────────")
+        print(f"   Query: {query[:120]}")
+        rule_threads = 0
+        rule_files = 0
 
         for thread in iter_all_threads(service, query):
             tid = thread["id"]
             if tid in seen_thread_ids:
                 continue
             seen_thread_ids.add(tid)
-            thread_count += 1
-            total_threads += 1
 
-            # Fetch the full thread so we get attachment data
             thread_data = service.users().threads().get(
                 userId="me", id=tid, format="full"
             ).execute()
 
             for msg in thread_data.get("messages", []):
-                # Double-check we're not downloading excluded senders
                 hdrs = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
                 from_addr = hdrs.get("From", "")
                 if any(ex in from_addr for ex in EXCLUDE_SENDERS):
                     continue
 
                 subj = hdrs.get("Subject", "(no subject)")
-                frm  = hdrs.get("From", "unknown")
+                frm = hdrs.get("From", "unknown")
                 print(f"  [{hdrs.get('Date','')[:16]}]  {frm[:40]}  |  {subj[:55]}")
-                count = download_attachments(service, msg, OUTPUT_DIR)
+                rule_inbox = INBOX_DIR / rule["inbox_dir"]
+                rule_inbox.mkdir(parents=True, exist_ok=True)
+                count = download_attachments(service, msg, rule_inbox)
                 if count == 0:
                     print(f"    –  no downloadable attachments")
-                total_files += count
+                rule_files += count
 
-        print(f"  → {thread_count} threads processed\n")
+            rule_threads += 1
+            total_threads += 1
+
+        total_files += rule_files
+        print(f"  → {rule_threads} threads, {rule_files} files\n")
 
     print("=" * 65)
-    print(f"Done!  {total_threads} email threads scanned.")
-    print(f"       {total_files} invoice files downloaded to:")
-    print(f"       {OUTPUT_DIR}")
+    print(f"Done!  {total_threads} threads scanned, {total_files} files downloaded.")
+    print(f"       {INBOX_DIR}")
     print("=" * 65)
 
 
