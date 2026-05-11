@@ -205,11 +205,14 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
     return saved
 
 
-def previous_month_start() -> str:
+def previous_month_range() -> tuple[str, str]:
     today = date.today()
     if today.month == 1:
-        return date(today.year - 1, 12, 1).strftime("%Y/%m/%d")
-    return date(today.year, today.month - 1, 1).strftime("%Y/%m/%d")
+        start = date(today.year - 1, 12, 1)
+    else:
+        start = date(today.year, today.month - 1, 1)
+    end = date(today.year, today.month, 1)
+    return start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -220,7 +223,13 @@ def main():
         "--since",
         metavar="YYYY/MM/DD",
         default=None,
-        help="Download emails since this date (default: 1st of previous month)",
+        help="Download emails since this date (use with --until for a range)",
+    )
+    parser.add_argument(
+        "--until",
+        metavar="YYYY/MM/DD",
+        default=None,
+        help="Download emails before this date (default: 1st of current month)",
     )
     parser.add_argument(
         "--rule",
@@ -230,8 +239,10 @@ def main():
     )
     args = parser.parse_args()
 
-    since = args.since or previous_month_start()
-    date_filter = f"after:{since}"
+    default_since, default_until = previous_month_range()
+    since = args.since or default_since
+    until = args.until or (default_until if not args.since else None)
+    date_filter = f"after:{since}" + (f" before:{until}" if until else "")
 
     active_rules = RULES
     if args.rule:
