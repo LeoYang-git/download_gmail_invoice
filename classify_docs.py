@@ -281,7 +281,11 @@ def unique_target(directory: Path, stem: str, suffix: str) -> Path:
     return candidate
 
 
-ALLOWED_SUFFIXES = {".pdf", ".xlsx", ".xls", ".docx", ".doc"}
+ALLOWED_SUFFIXES = {".pdf", ".xlsx", ".xls", ".docx", ".doc",
+                    ".jpg", ".jpeg", ".png", ".heic"}
+
+# Files from these subfolders are never deleted — left in Inbox if unclassifiable
+NEVER_DELETE_DIRS = {"Self-Sent"}
 
 
 def collect_inbox_files() -> list[tuple[Path, dict | None]]:
@@ -368,6 +372,10 @@ def main():
             new_stem = build_target_name(f, description, "properties")
             rel_dest = str(dest.relative_to(FINANCE_DIR))
             to_move.append((f, dest, "properties", description))
+        elif f.parent.name in NEVER_DELETE_DIRS:
+            new_stem = ""
+            rel_dest = "SKIP (review manually)"
+            to_skip.append(f)
         else:
             new_stem = ""
             rel_dest = "DELETE"

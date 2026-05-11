@@ -52,6 +52,18 @@ RULES = [
         "inbox_dir": "More Telecom",      # → Spending/Software
     },
     {
+        "name": "Self-Sent",
+        "query": (
+            "(from:leo.yang.au@gmail.com OR from:leo.yang@cba.com.au)"
+            " has:attachment"
+        ),
+        "inbox_dir": "Self-Sent",         # → full classification; never deleted
+        "allowed_extensions": {
+            ".pdf", ".xlsx", ".xls", ".docx", ".doc",
+            ".jpg", ".jpeg", ".png", ".heic",
+        },
+    },
+    {
         "name": "Generic Invoices & Receipts",
         "query": (
             "(subject:invoice OR subject:receipt OR subject:\"tax invoice\""
@@ -60,6 +72,8 @@ RULES = [
             " -from:kuringgai@pml.com.au"
             " -from:noreply@amber.com.au"
             " -from:@moretelecom.com.au"
+            " -from:leo.yang.au@gmail.com"
+            " -from:leo.yang@cba.com.au"
         ),
         "inbox_dir": "Generic",           # → full classification
     },
@@ -158,7 +172,8 @@ def unique_path(directory: Path, stem: str, suffix: str) -> Path:
     return candidate
 
 
-def download_attachments(service, message: dict, output_dir: Path) -> int:
+def download_attachments(service, message: dict, output_dir: Path,
+                         allowed_extensions: set | None = None) -> int:
     msg_id = message["id"]
     headers = {
         h["name"]: h["value"]
@@ -175,7 +190,8 @@ def download_attachments(service, message: dict, output_dir: Path) -> int:
             continue
 
         suffix = Path(filename).suffix.lower()
-        if ALLOWED_EXTENSIONS and suffix not in ALLOWED_EXTENSIONS:
+        exts = allowed_extensions if allowed_extensions is not None else ALLOWED_EXTENSIONS
+        if exts and suffix not in exts:
             continue
 
         body = part.get("body", {})
@@ -291,7 +307,8 @@ def main():
                 print(f"  [{hdrs.get('Date','')[:16]}]  {frm[:40]}  |  {subj[:55]}")
                 rule_inbox = INBOX_DIR / rule["inbox_dir"]
                 rule_inbox.mkdir(parents=True, exist_ok=True)
-                count = download_attachments(service, msg, rule_inbox)
+                count = download_attachments(service, msg, rule_inbox,
+                                             rule.get("allowed_extensions"))
                 if count == 0:
                     print(f"    –  no downloadable attachments")
                 rule_files += count
